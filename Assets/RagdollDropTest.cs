@@ -6,21 +6,34 @@ namespace PersonalSpace
     {
         private void Awake()
         {
+            var controller = GetComponent<ActiveRagdollController>();
             var floor = GameObject.CreatePrimitive(PrimitiveType.Cube);
             floor.name = "Test Floor";
             floor.transform.SetParent(transform, false);
             floor.transform.localPosition = new Vector3(0f, -0.25f, 0f);
-            floor.transform.localScale = new Vector3(12f, 0.5f, 12f);
+            float floorWidth = controller != null ? RagdollTestArena.FloorWidth : 12f;
+            floor.transform.localScale = new Vector3(floorWidth, 0.5f, floorWidth);
 
-            // Start above the floor with a slight lean so the impact produces a fall.
-            var body = new GameObject("Test Ragdoll").transform;
-            body.SetParent(transform, false);
-            body.localPosition = Vector3.up * 0.55f;
-            body.localRotation = Quaternion.Euler(0f, 0f, -12f);
+            bool passive = controller == null;
+            Vector3 bodyPosition = passive ? Vector3.up * 0.55f : Vector3.zero;
+            Quaternion bodyRotation = passive ? Quaternion.Euler(0f, 0f, -12f) : Quaternion.identity;
+            Transform body = BuildRig(transform, "Test Ragdoll", bodyPosition, bodyRotation,
+                out Rigidbody hips, out Rigidbody chest);
 
-            var hips = AddPart(body, "Hips", new Vector3(0f, 1.07f, 0f),
+            if (controller != null)
+                controller.Initialize(body, hips, chest, floor.GetComponent<Collider>());
+        }
+
+        internal static Transform BuildRig(Transform parent, string name, Vector3 position, Quaternion rotation,
+            out Rigidbody hips, out Rigidbody chest)
+        {
+            var body = new GameObject(name).transform;
+            body.SetParent(parent, false);
+            body.SetLocalPositionAndRotation(position, rotation);
+
+            hips = AddPart(body, "Hips", new Vector3(0f, 1.07f, 0f),
                 new Vector3(0.48f, 0.26f, 0.28f), 8f);
-            var chest = AddPart(body, "Chest", new Vector3(0f, 1.46f, 0f),
+            chest = AddPart(body, "Chest", new Vector3(0f, 1.46f, 0f),
                 new Vector3(0.54f, 0.5f, 0.3f), 12f);
             var head = AddPart(body, "Head", new Vector3(0f, 1.9f, 0f),
                 new Vector3(0.28f, 0.32f, 0.28f), 3f);
@@ -30,6 +43,7 @@ namespace PersonalSpace
 
             AddLimbs(body, hips, chest, "Left", -1f);
             AddLimbs(body, hips, chest, "Right", 1f);
+            return body;
         }
 
         private static void AddLimbs(Transform body, Rigidbody hips, Rigidbody chest,
