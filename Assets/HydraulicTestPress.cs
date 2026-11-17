@@ -4,11 +4,11 @@ namespace PersonalSpace
 {
     internal sealed class HydraulicTestPress
     {
-        private const float RaisedHeight = 3.45f;
-        private const float LoweredHeight = 0.68f;
+        private const float RaisedHeight = 4.75f;
+        private const float LoweredHeight = 1.12f;
         private const float PlateThickness = 0.34f;
         private const float PlateDiameter = 3.7f;
-        private const float BarrelBottom = 3.8f;
+        private const float BarrelBottom = 5.16f;
 
         private readonly Transform frame;
         private readonly Rigidbody head;
@@ -27,14 +27,14 @@ namespace PersonalSpace
 
             var steel = new Color(0.31f, 0.36f, 0.43f);
             var hazard = new Color(0.96f, 0.57f, 0.17f);
-            RagdollTestArena.Block(frame, "Left Press Column", new Vector3(-2.35f, 2.8f, 0f),
-                new Vector3(0.45f, 5.6f, 0.55f), steel);
-            RagdollTestArena.Block(frame, "Right Press Column", new Vector3(2.35f, 2.8f, 0f),
-                new Vector3(0.45f, 5.6f, 0.55f), steel);
-            RagdollTestArena.Block(frame, "Press Crossbeam", new Vector3(0f, 5.55f, 0f),
+            RagdollTestArena.Block(frame, "Left Press Column", new Vector3(-2.35f, 3.43f, 0f),
+                new Vector3(0.45f, 6.86f, 0.55f), steel);
+            RagdollTestArena.Block(frame, "Right Press Column", new Vector3(2.35f, 3.43f, 0f),
+                new Vector3(0.45f, 6.86f, 0.55f), steel);
+            RagdollTestArena.Block(frame, "Press Crossbeam", new Vector3(0f, 6.84f, 0f),
                 new Vector3(5.35f, 0.5f, 0.85f), hazard);
 
-            CreateCylinder(frame, "Hydraulic Barrel", new Vector3(0f, 4.65f, 0f), 1.12f, 1.7f, steel);
+            CreateCylinder(frame, "Hydraulic Barrel", new Vector3(0f, 6.01f, 0f), 1.12f, 1.7f, steel);
             rod = CreateCylinder(frame, "Hydraulic Rod", Vector3.zero, 0.48f, 1f,
                 new Color(0.63f, 0.69f, 0.72f));
             rodMeshHeight = rod.GetComponent<MeshFilter>().sharedMesh.bounds.size.y;
@@ -44,6 +44,9 @@ namespace PersonalSpace
             piston.transform.localPosition = Vector3.up * height;
             Transform plateShape = CreateCylinder(piston.transform, "Press Face", Vector3.zero,
                 PlateDiameter, PlateThickness, hazard);
+            int impactLayer = LayerMask.NameToLayer(PillMovementContact.ImpactLayer);
+            if (impactLayer >= 0)
+                plateShape.gameObject.layer = impactLayer;
             var hull = plateShape.gameObject.AddComponent<MeshCollider>();
             hull.sharedMesh = plateShape.GetComponent<MeshFilter>().sharedMesh;
             hull.convex = true;

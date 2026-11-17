@@ -68,14 +68,22 @@ namespace PersonalSpace
             press = new HydraulicTestPress(parent, pressPosition);
         }
 
+        public RagdollTestArena(Collider floor, Collider[] obstacles, Transform pressSpawn)
+        {
+            this.floor = floor;
+            this.obstacles = obstacles ?? System.Array.Empty<Collider>();
+            rails = System.Array.Empty<Collider>();
+            press = new HydraulicTestPress(pressSpawn, Vector3.zero);
+        }
+
         public void TogglePress() => press.Toggle();
         public void StepPress(float step) => press.Step(step);
-        public bool HasStandingClearance(Vector3 ground) => !press.Covers(ground, ground.y + 2.1f);
-        public bool PressIsLowOver(Vector3 position) => press.Covers(position, floor.bounds.max.y + 1.28f);
+        public bool HasStandingClearance(Vector3 ground, float clearance = 2.1f) => !press.Covers(ground, ground.y + clearance);
+        public bool PressIsLowOver(Vector3 position, float clearance = 1.28f) => press.Covers(position, floor.bounds.max.y + clearance);
 
-        public bool IsRecoverySpotClear(Vector3 point)
+        public bool IsRecoverySpotClear(Vector3 point, float clearance = 2.1f)
         {
-            return InsideRails(point) && ClearOfObstacles(point) && HasStandingClearance(point);
+            return InsideRails(point) && ClearOfObstacles(point) && HasStandingClearance(point, clearance);
         }
 
         public bool Raycast(Ray ray, float distance, out RaycastHit nearest)
@@ -111,10 +119,10 @@ namespace PersonalSpace
             return found;
         }
 
-        public Vector3 GetClearRecoverySpot(Vector3 ground)
+        public Vector3 GetClearRecoverySpot(Vector3 ground, float clearance = 2.1f)
         {
             // Prefer room to get up beside a step or rail instead of through it.
-            if (IsRecoverySpotClear(ground))
+            if (IsRecoverySpotClear(ground, clearance))
                 return ground;
 
             for (float radius = 0.45f; radius <= 2.7f; radius += 0.45f)
@@ -124,7 +132,7 @@ namespace PersonalSpace
                     Vector3 offset = Quaternion.Euler(0f, direction * 45f, 0f) * Vector3.forward * radius;
                     Vector3 candidate = ground + offset;
                     if (Raycast(new Ray(candidate + Vector3.up, Vector3.down), 2f, out RaycastHit hit) &&
-                        IsRecoverySpotClear(hit.point))
+                        IsRecoverySpotClear(hit.point, clearance))
                         return hit.point;
                 }
             }
