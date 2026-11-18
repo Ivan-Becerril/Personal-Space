@@ -54,11 +54,15 @@ namespace PersonalSpace
         private float externalImpactHold;
         private float nextBodyBumpTime;
         private Camera followCamera;
+        private PillArenaCamera arenaCamera;
+        private PillGripTargeting gripTargeting;
         private Vector3 horizontalVelocity;
         private float verticalVelocity;
-        private float yaw;
-        private float pitch = 18f;
-        private float cameraDistance = 5f * FighterScale;
+        private float requestedGripTension;
+        private float gripTension;
+        private float gripPullExpires;
+        private bool hanging;
+        private float hangWeight;
         private Transform player;
         private Transform motionRoot;
         private PlayableGraph graph;
@@ -70,6 +74,7 @@ namespace PersonalSpace
         private PillArmMotion leftArm;
         private PillArmMotion rightArm;
         private PillFlyingKick flyingKick;
+        private readonly PillClimbing climbing = new PillClimbing();
         private BodyPart torso;
         private BodyPart leftShoulder;
         private BodyPart rightShoulder;
@@ -77,19 +82,11 @@ namespace PersonalSpace
         private readonly System.Collections.Generic.List<BodyPart> parts =
             new System.Collections.Generic.List<BodyPart>();
 
-        private readonly System.Collections.Generic.Dictionary<FighterAnatomy.Shape, Mesh> anatomyMeshes =
-            new System.Collections.Generic.Dictionary<FighterAnatomy.Shape, Mesh>();
-        private readonly System.Collections.Generic.List<VisualJoin> visualJoins =
-            new System.Collections.Generic.List<VisualJoin>();
-
-        private struct VisualJoin
-        {
-            internal ConfigurableJoint Joint;
-            internal BodyPart Child;
-            internal BodyPart Parent;
-            internal Transform Shape;
-            internal float Width;
-        }
+        private SkinnedMeshRenderer fighterModel;
+        private PhysicsMaterial footGrip;
+        private RagdollFootContact leftFootContact;
+        private RagdollFootContact rightFootContact;
+        private float groundLoad;
 
         internal sealed class BodyPart
         {
@@ -102,11 +99,8 @@ namespace PersonalSpace
             internal float NormalDepenetrationSpeed;
             internal Collider Contact;
             internal Transform End;
-            internal Transform Visual;
             internal float Width;
             internal float Depth;
-            internal Color Color;
-            internal bool UsesAnatomyMesh;
         }
 
         private void Awake()
@@ -131,8 +125,11 @@ namespace PersonalSpace
             player.gameObject.AddComponent<PillMovementContact>().Initialize(this);
             SetHeight(StandingHeight);
             followCamera = isPracticeDummy ? null : Camera.main;
-            yaw = followCamera != null ? followCamera.transform.eulerAngles.y : 0f;
-            BuildAppearance();
+            if (followCamera != null)
+                arenaCamera = new PillArenaCamera(followCamera);
+            if (!isPracticeDummy)
+                gripTargeting = new PillGripTargeting(this);
+            BuildMotionRig();
             torso = parts.Find(part => part.Bone == HumanBodyBones.Hips && part.End != null);
             if (torso != null)
             {
@@ -141,6 +138,12 @@ namespace PersonalSpace
                 UpdateArmTargets(0f);
             }
             BuildPhysicalBody();
+            if (parts.Count > 0)
+            {
+                fighterModel = FighterAnatomy.Build(player, parts, isPracticeDummy);
+                if (fighterModel == null)
+                    CreateFallbackPill();
+            }
             leftShoulder = parts.Find(part => part.Bone == HumanBodyBones.LeftUpperArm);
             rightShoulder = parts.Find(part => part.Bone == HumanBodyBones.RightUpperArm);
             if (!isPracticeDummy)
@@ -235,10 +238,14 @@ namespace PersonalSpace
                 return;
 
             Rigidbody otherBody = collision.rigidbody;
+            PillBodyContact otherPart = otherBody != null ? otherBody.GetComponent<PillBodyContact>() : null;
+            ContactPoint contact = collision.GetContact(0);
+            if (arm?.WantsGrip == true && !climbing.IsPullingOver && Status == FighterStatus.Conscious &&
+                (otherPart == null || otherPart.Fighter != this))
+                arm.TryGrip(ownPart.Body, collision.collider, otherBody, contact.point, contact.normal);
+
             if (otherBody == null)
                 return;
-            otherBody.TryGetComponent(out PillBodyContact otherPart);
-            ContactPoint contact = collision.GetContact(0);
             if (otherPart == null)
             {
                 HandleExternalContact(ownPart, otherBody, collision, contact, newContact);
@@ -309,8 +316,15 @@ namespace PersonalSpace
                 return;
 
             condition.KnockOut(knockoutTime);
+            leftArm?.ResetInput();
+            rightArm?.ResetInput();
+            climbing.Cancel();
             flyingKick?.Cancel();
             horizontalVelocity = knockbackVelocity = Vector3.zero;
+            requestedGripTension = gripTension = 0f;
+            gripPullExpires = 0f;
+            hanging = false;
+            hangWeight = 0f;
             verticalVelocity = 0f;
             jumping = false;
             SetHeight(PressDuckHeight, StandingHeight);
@@ -504,20 +518,24 @@ namespace PersonalSpace
             bool crouched = wantsCrouch || duckingUnderPress;
 
             var mouse = isPracticeDummy ? null : Mouse.current;
-            if (mouse != null)
+            bool canUseArms = !unconscious && flyingKick?.IsActive != true;
+            bool canJab = recovering || !duckingUnderPress;
+            if (canUseArms)
             {
-                if (mouse.middleButton.isPressed)
-                {
-                    Vector2 drag = mouse.delta.ReadValue();
-                    yaw += drag.x * 0.18f;
-                    pitch = Mathf.Clamp(pitch - drag.y * 0.18f, 8f, 72f);
-                }
-                cameraDistance = Mathf.Clamp(cameraDistance - mouse.scroll.ReadValue().y * 0.006f * FighterScale, 2.5f * FighterScale, 10f * FighterScale);
-                if (!unconscious && (recovering || !duckingUnderPress) && flyingKick?.IsActive != true && mouse.leftButton.wasPressedThisFrame)
-                    StartJab(leftArm, mouse.position.ReadValue());
-                if (!unconscious && (recovering || !duckingUnderPress) && flyingKick?.IsActive != true && mouse.rightButton.wasPressedThisFrame)
-                    StartJab(rightArm, mouse.position.ReadValue());
+                Vector2 cursor = mouse != null ? mouse.position.ReadValue() : Vector2.zero;
+                ReadHandButton(leftArm, mouse?.leftButton, cursor, canJab, step);
+                ReadHandButton(rightArm, mouse?.rightButton, cursor, canJab, step);
+
             }
+            else
+            {
+                leftArm?.ResetInput();
+                rightArm?.ResetInput();
+            }
+
+            bool holding = leftArm?.GrabHeld == true || rightArm?.GrabHeld == true;
+            bool hoisting = keyboard?.spaceKey.isPressed == true;
+
 
             Vector2 input = Vector2.zero;
             bool wantsJump = false;
@@ -525,34 +543,44 @@ namespace PersonalSpace
             {
                 input = Vector2.ClampMagnitude(new Vector2(Axis(keyboard.dKey, keyboard.aKey),
                     Axis(keyboard.wKey, keyboard.sKey)), 1f);
-                yaw += Axis(keyboard.eKey, keyboard.qKey) * 100f * step;
                 wantsJump = keyboard.spaceKey.wasPressedThisFrame;
-                if (keyboard.rKey.wasPressedThisFrame)
-                {
-                    yaw = player.eulerAngles.y;
-                    pitch = 18f;
-                    cameraDistance = 5f * FighterScale;
-                }
             }
 
             if (unconscious)
                 return;
 
-            Quaternion view = Quaternion.Euler(0f, yaw, 0f);
+            Quaternion view = Quaternion.Euler(0f, arenaCamera?.Yaw ?? 0f, 0f);
             Vector3 direction = view * new Vector3(input.x, 0f, input.y);
-            if (flyingKick?.IsActive != true && direction.sqrMagnitude > 0.01f)
+            BodyPart pelvis = torso?.Parent;
+            Vector3 hipOffset = pelvis != null ? pelvis.Start.position - player.position : Vector3.up;
+            Vector3 hips = pelvis != null ? pelvis.Body.position : player.position + hipOffset;
+            bool wasHanging = hanging;
+            bool isClimbing = climbing.TryMove(capsule, player, hipOffset, hips, SupportedFootHeight(),
+                leftArm, rightArm, direction, hoisting, holding, ClimbingShoulder(), out Vector3 climbVelocity,
+                out Vector3 climbHeading);
+            hanging = isClimbing;
+            if (wasHanging && !hanging && pelvis != null && !capsule.isGrounded)
+                verticalVelocity = pelvis.Body.linearVelocity.y;
+            bool latched = leftArm?.HasGrip == true || rightArm?.HasGrip == true;
+            if (isClimbing)
+                player.rotation = Quaternion.RotateTowards(player.rotation, Quaternion.LookRotation(climbHeading), 260f * step);
+            else if (!latched && flyingKick?.IsActive != true && direction.sqrMagnitude > 0.01f)
                 player.rotation = Quaternion.RotateTowards(player.rotation,
                     Quaternion.LookRotation(direction), 720f * step);
 
             bool grounded = capsule.isGrounded && !jumping;
             float speed = crouched ? CrouchSpeed : shift ? RunSpeed : WalkSpeed;
+            var leftHeld = HeldFighterPart(leftArm);
+            var rightHeld = HeldFighterPart(rightArm);
+            if (leftHeld != null || rightHeld != null)
+                speed = Mathf.Min(speed, 2.65f);
             UpdateHorizontalMomentum(direction, speed, grounded, step);
 
             if (grounded && verticalVelocity <= 0f)
             {
                 verticalVelocity = -2f;
                 jumping = false;
-                if (wantsJump && !crouched)
+                if (wantsJump && !crouched && !isClimbing)
                 {
                     verticalVelocity = JumpSpeed;
                     jumping = true;
@@ -561,7 +589,7 @@ namespace PersonalSpace
             if (duckingUnderPress)
                 flyingKick?.Cancel();
             bool airborne = jumping || (!capsule.isGrounded && capsule.velocity.y < -0.5f);
-            if (!crouched && airborne && keyboard != null && keyboard.fKey.wasPressedThisFrame && flyingKick != null)
+            if (!holding && !crouched && airborne && keyboard != null && keyboard.fKey.wasPressedThisFrame && flyingKick != null)
             {
                 Vector3 kickDirection = direction.sqrMagnitude > 0.01f ? direction.normalized : player.forward;
                 flyingKick.Start(kickDirection);
@@ -569,14 +597,29 @@ namespace PersonalSpace
                     player.rotation = Quaternion.LookRotation(flyingKick.Direction);
             }
 
-            verticalVelocity += Physics.gravity.y * step;
+            Vector3 correction = Vector3.Lerp(GetStumbleVelocity(), GetGripFollowVelocity(), gripTension);
+            if (isClimbing)
+            {
+                horizontalVelocity = Vector3.zero;
+                verticalVelocity = 0f;
+                jumping = false;
+                correction = climbVelocity;
+            }
+            else
+                verticalVelocity += Physics.gravity.y * step;
+
+
             previousMoveVelocity = capsule.velocity;
-            Vector3 stumbleVelocity = GetStumbleVelocity();
-            Vector3 requestedVelocity = horizontalVelocity + knockbackVelocity + stumbleVelocity;
-            CollisionFlags hits = capsule.Move((requestedVelocity + Vector3.up * verticalVelocity) * step);
+            Vector3 requestedVelocity = horizontalVelocity + knockbackVelocity + Vector3.ProjectOnPlane(correction, Vector3.up);
+            Vector3 movement = requestedVelocity + Vector3.up * (verticalVelocity + correction.y);
+            CollisionFlags hits = capsule.Move(movement * step);
             Vector3 actualHorizontal = Vector3.ProjectOnPlane(capsule.velocity, Vector3.up);
+            if (leftHeld != null)
+                PullHeldFighter(leftHeld, actualHorizontal, rightHeld != null && rightHeld.Fighter == leftHeld.Fighter);
+            if (rightHeld != null && (leftHeld == null || leftHeld.Fighter != rightHeld.Fighter))
+                PullHeldFighter(rightHeld, actualHorizontal, false);
             if ((hits & CollisionFlags.Sides) != 0)
-                DropBlockedMomentum(requestedVelocity - actualHorizontal, stumbleVelocity);
+                DropBlockedMomentum(requestedVelocity - actualHorizontal, correction);
             if ((hits & CollisionFlags.Below) != 0)
             {
                 float braking = knockbackDeceleration * Mathf.Lerp(2f, 0.85f, bodyStagger);
@@ -590,10 +633,76 @@ namespace PersonalSpace
                 flyingKick?.Land();
             }
 
-            float actualSpeed = actualHorizontal.magnitude;
+            float gaitSpeed = isClimbing ? 0f : GetGaitSpeed(direction, actualHorizontal);
             int target = jumping && jump != null ? 3 :
-                actualSpeed > 0.15f ? (actualSpeed > WalkSpeed + 0.35f && !crouched ? 2 : 1) : 0;
-            UpdateAnimation(target, actualSpeed, step);
+                gaitSpeed > 0.15f ? (gaitSpeed > WalkSpeed + 0.35f && !crouched ? 2 : 1) : 0;
+            UpdateAnimation(target, gaitSpeed, step);
+        }
+
+        private float GetGaitSpeed(Vector3 direction, Vector3 actualHorizontal)
+        {
+            // Only movement the fighter is trying to make should advance a walk cycle.
+            return Mathf.Min(Mathf.Max(0f, Vector3.Dot(actualHorizontal, direction)), horizontalVelocity.magnitude);
+        }
+
+        private static PillBodyContact HeldFighterPart(PillArmMotion arm)
+            => arm?.HasGrip == true ? arm.HeldFighterPart : null;
+
+        private void PullHeldFighter(PillBodyContact held, Vector3 travel, bool twoHands)
+        {
+            AnimatedPillPlayer other = held.Fighter;
+            if (other == null || other.Status == FighterStatus.KnockedOut || travel.sqrMagnitude < 0.09f)
+                return;
+
+            Vector3 separation = Vector3.ProjectOnPlane(player.position - other.player.position, Vector3.up);
+            if (Vector3.Dot(travel, separation.normalized) < -0.1f)
+                return;
+
+            // Signal the pose to yield. The grip joint supplies the actual pull.
+            float stretch = Mathf.InverseLerp(0.90f, 1.70f, separation.magnitude);
+            other.requestedGripTension = Mathf.Lerp(twoHands ? 0.85f : 0.72f, 1f, stretch);
+            other.gripPullExpires = Time.time + 0.10f;
+            if (held.Part != null)
+                held.Part.ImpactReaction = Mathf.Max(held.Part.ImpactReaction, 0.34f);
+        }
+
+        private Vector3 GetGripFollowVelocity()
+        {
+            if (gripTension <= 0f)
+                return Vector3.zero;
+
+            Vector3 drift = Vector3.zero;
+            float weight = 0f;
+            foreach (BodyPart part in parts)
+            {
+                if (part.Bone != HumanBodyBones.Hips && !IsLowerBody(part.Bone))
+                    continue;
+
+                GetPose(part, out Vector3 pose, out _, out _);
+                drift += (part.Body.worldCenterOfMass - pose) * part.Body.mass;
+                weight += part.Body.mass;
+            }
+
+            if (weight <= 0f)
+                return Vector3.zero;
+            drift = Vector3.ProjectOnPlane(drift / weight, Vector3.up);
+            return Vector3.ClampMagnitude(Vector3.MoveTowards(drift, Vector3.zero, 0.08f) * 8f, 3.4f);
+        }
+
+        private void ReadHandButton(PillArmMotion arm, UnityEngine.InputSystem.Controls.ButtonControl button,
+            Vector2 cursor, bool canJab, float step)
+        {
+            if (arm == null)
+                return;
+            if (button == null)
+            {
+                arm.ResetInput();
+                return;
+            }
+
+            bool tapped = arm.UpdateButton(button.wasPressedThisFrame, button.wasReleasedThisFrame, button.isPressed, step);
+            if (tapped && canJab)
+                StartJab(arm, cursor);
         }
 
         private void UpdateHorizontalMomentum(Vector3 direction, float speed, bool grounded, float step)
@@ -685,9 +794,19 @@ namespace PersonalSpace
                     ForceMode.Acceleration);
             }
 
+            float requestedTension = Time.time < gripPullExpires ? requestedGripTension : 0f;
+            gripTension = Mathf.MoveTowards(gripTension, requestedTension, step * 6f);
+            hangWeight = Mathf.MoveTowards(hangWeight, hanging ? 1f : 0f, step * 6f);
             float stumble = StumbleStrength;
+            bool feetSupported = leftFootContact?.HasSupport == true || rightFootContact?.HasSupport == true;
+            float expectedLoad = feetSupported ? 1f : capsule.isGrounded ? 0.65f : 0f;
+            groundLoad = Mathf.MoveTowards(groundLoad, expectedLoad, step * 7f);
+            if (hanging)
+                ApplyClimbPhysics();
+
             float hipDrop = capsule.isGrounded ? StumbleHipDrop * stumble : 0f;
-            float gravitySupport = Mathf.Lerp(0.90f, 0.10f, stumble) * recovery;
+            float gravitySupport = Mathf.Lerp(0.86f, 0.16f, groundLoad) * (1f - stumble * 0.78f) * recovery;
+            gravitySupport *= Mathf.Lerp(1f, 0.28f, gripTension) * (1f - hangWeight);
             foreach (BodyPart part in parts)
             {
                 GetPose(part, out Vector3 position, out Quaternion rotation, out _);
@@ -726,11 +845,33 @@ namespace PersonalSpace
                     positionDrive *= drive;
                     rotationDrive *= drive;
                 }
+                float limbYield = LimbYield(part.Bone, drivingPunch || arm?.HasGrip == true || arm?.IsReachingUp == true);
+                bool tuckingLeg = climbing.IsPullingOver && IsLowerBody(part.Bone);
+                if (tuckingLeg)
+                {
+                    float tuck = 1f - HipDropWeight(part.Bone);
+                    position += climbing.IntoLedge * (0.47f * tuck);
+                    position.y = Mathf.Lerp(position.y, Mathf.Max(position.y, climbing.Landing.y + 0.16f), tuck);
+                    limbYield *= 0.58f;
+                }
+                positionDrive *= Mathf.Lerp(1f, 0.025f, limbYield);
+                rotationDrive *= Mathf.Lerp(1f, 0.025f, limbYield);
+                float weightSupport = gravitySupport * Mathf.Lerp(1f, 0.07f, limbYield);
                 Vector3 positionError = position - body.position;
-                float positionStrength = drivingPunch ? 300f : retractingPunch ? 200f : 145f;
+                float positionStrength = drivingPunch ? 300f : retractingPunch || arm?.WantsGrip == true ? 200f : 145f;
                 float maxAcceleration = drivingPunch ? 280f : retractingPunch ? 160f : 110f;
-                Vector3 acceleration = (positionError * positionStrength
-                    + velocityError * (drivingPunch ? 13f : 18f)) * positionDrive - Physics.gravity * gravitySupport;
+                Vector3 poseAcceleration = (positionError * positionStrength
+                    + velocityError * (drivingPunch ? 13f : 18f)) * positionDrive;
+                if (poseAcceleration.y > 0f && !drivingPunch)
+                {
+                    // Let planted feet and joint constraints support the upper body.
+                    float load = part.Bone == HumanBodyBones.Hips || part.Bone == HumanBodyBones.Neck ||
+                        part.Bone == HumanBodyBones.Head ? groundLoad : 0f;
+                    poseAcceleration.y *= Mathf.Lerp(1f, 0.48f, load);
+                }
+                if (arm?.HasGrip != true && arm?.IsReachingUp != true && !tuckingLeg && !drivingPunch)
+                    poseAcceleration.y *= Mathf.Lerp(1f, 0.07f, hangWeight);
+                Vector3 acceleration = poseAcceleration - Physics.gravity * weightSupport;
                 body.AddForce(Vector3.ClampMagnitude(acceleration, maxAcceleration), ForceMode.Acceleration);
 
                 Quaternion delta = rotation * Quaternion.Inverse(body.rotation);
@@ -740,6 +881,63 @@ namespace PersonalSpace
                 Vector3 angular = (axis * (angle * Mathf.Deg2Rad * (drivingPunch ? 175f : 105f))
                     - body.angularVelocity * (drivingPunch ? 8f : 14f)) * rotationDrive;
                 body.AddTorque(Vector3.ClampMagnitude(angular, drivingPunch ? 240f : 125f), ForceMode.Acceleration);
+            }
+        }
+
+        private void ApplyClimbPhysics()
+        {
+            bool leftBraced = IsClimbingGrip(leftArm);
+            bool rightBraced = IsClimbingGrip(rightArm);
+            if (!leftBraced && !rightBraced)
+                return;
+
+            bool hoisting = !isPracticeDummy && Keyboard.current?.spaceKey.isPressed == true;
+            bool pressing = hoisting && climbing.IsPullingOver;
+            float limit = leftBraced && rightBraced ? 630f : 950f;
+            if (leftBraced)
+                leftArm.PullFromGrip(leftShoulder?.Joint, climbing.IntoLedge, hoisting, pressing, limit);
+            if (rightBraced)
+                rightArm.PullFromGrip(rightShoulder?.Joint, climbing.IntoLedge, hoisting, pressing, limit);
+
+            torso.Body.AddForce(climbing.Swing * (bodyMass * 2.4f));
+        }
+
+        private bool IsClimbingGrip(PillArmMotion arm) => climbing.IsPullingOver
+            ? PillClimbing.CanBraceWith(arm) : PillClimbing.CanHangFrom(arm, player.position);
+
+        private Vector3? ClimbingShoulder()
+        {
+            bool leftBraced = PillClimbing.CanHangFrom(leftArm, player.position);
+            bool rightBraced = PillClimbing.CanHangFrom(rightArm, player.position);
+            if (leftBraced && (!rightBraced || leftArm.GripPoint.y >= rightArm.GripPoint.y))
+                return PhysicalShoulder(leftShoulder);
+            return rightBraced ? PhysicalShoulder(rightShoulder) : null;
+        }
+
+        private float SupportedFootHeight()
+        {
+            float left = leftFootContact?.HasSupport == true ? leftFootContact.transform.position.y : float.NegativeInfinity;
+            float right = rightFootContact?.HasSupport == true ? rightFootContact.transform.position.y : float.NegativeInfinity;
+            return Mathf.Max(left, right);
+        }
+
+        private float LimbYield(HumanBodyBones bone, bool activelyUsingArm)
+        {
+            if (activelyUsingArm)
+                return 0f;
+            switch (bone)
+            {
+                case HumanBodyBones.LeftUpperLeg:
+                case HumanBodyBones.RightUpperLeg:
+                case HumanBodyBones.LeftLowerLeg:
+                case HumanBodyBones.RightLowerLeg:
+                case HumanBodyBones.LeftFoot:
+                case HumanBodyBones.RightFoot:
+                    return Mathf.Max(Mathf.Clamp01(gripTension * 1.35f), hangWeight);
+                case HumanBodyBones.Hips:
+                    return Mathf.Max(gripTension * 0.78f, hangWeight * 0.42f);
+                default:
+                    return Mathf.Max(gripTension * 0.80f, hangWeight * 0.68f);
             }
         }
 
@@ -759,19 +957,15 @@ namespace PersonalSpace
 
         private void LateUpdate()
         {
-            foreach (VisualJoin join in visualJoins)
-                PlaceVisualJoin(join);
 
-            if (followCamera == null)
-                return;
-            Vector3 focus = player.position + Vector3.up * Mathf.Min(capsule.height * 0.62f, 1.1f * FighterScale);
-            Quaternion orbit = Quaternion.Euler(pitch, yaw, 0f);
-            Vector3 back = orbit * Vector3.back;
-            float distance = cameraDistance;
-            if (arena.RaycastCamera(new Ray(focus, back), distance, out RaycastHit hit))
-                distance = Mathf.Max(0.22f, hit.distance - 0.18f);
-            followCamera.transform.SetPositionAndRotation(focus + back * distance, orbit);
+
+            if (arenaCamera != null)
+                arenaCamera.Track(CameraFocus(), opponent != null ? opponent.CameraFocus() : (Vector3?)null,
+                    arena, Time.deltaTime);
         }
+
+        private Vector3 CameraFocus()
+            => player.position + Vector3.up * Mathf.Min(capsule.height * 0.62f, 1.05f * FighterScale);
 
         private void SetHeight(float height, float? poseHeight = null)
         {
@@ -792,7 +986,7 @@ namespace PersonalSpace
 
         private void RefreshCapsuleIgnores()
         {
-            if (!capsule.enabled)
+            if (capsule == null || !capsule.enabled)
                 return;
 
             foreach (BodyPart part in parts)
@@ -836,7 +1030,7 @@ namespace PersonalSpace
             }
         }
 
-        private void BuildAppearance()
+        private void BuildMotionRig()
         {
             if (motionModel == null || idle == null || walk == null || run == null)
             {
@@ -880,30 +1074,27 @@ namespace PersonalSpace
             graph.Evaluate(0f);
             flyingKick = new PillFlyingKick(animator);
 
-            var teal = isPracticeDummy ? new Color(0.57f, 0.40f, 0.82f) : new Color(0.22f, 0.74f, 0.68f);
-            var blue = new Color(0.2f, 0.36f, 0.53f);
-            var orange = new Color(0.98f, 0.58f, 0.26f);
-            var skin = new Color(0.73f, 0.49f, 0.32f);
-            AddPart(animator, HumanBodyBones.Hips, HumanBodyBones.UpperChest, 0.44f, 0.255f, teal);
-            AddPart(animator, HumanBodyBones.Hips, HumanBodyBones.LastBone, 0.37f, 0.285f, blue);
-            AddPart(animator, HumanBodyBones.Neck, HumanBodyBones.Head, 0.145f, 0.145f, skin);
-            AddPart(animator, HumanBodyBones.Head, HumanBodyBones.LastBone, 0.265f, 0.265f, skin);
-            AddPart(animator, HumanBodyBones.LeftUpperArm, HumanBodyBones.LeftLowerArm, 0.215f, 0.208f, teal);
-            AddPart(animator, HumanBodyBones.RightUpperArm, HumanBodyBones.RightLowerArm, 0.215f, 0.208f, teal);
-            AddPart(animator, HumanBodyBones.LeftLowerArm, HumanBodyBones.LeftHand, 0.173f, 0.166f, teal);
-            AddPart(animator, HumanBodyBones.RightLowerArm, HumanBodyBones.RightHand, 0.173f, 0.166f, teal);
-            AddPart(animator, HumanBodyBones.LeftHand, HumanBodyBones.LastBone, 0.157f, 0.144f, skin);
-            AddPart(animator, HumanBodyBones.RightHand, HumanBodyBones.LastBone, 0.157f, 0.144f, skin);
-            AddPart(animator, HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, 0.265f, 0.25f, teal);
-            AddPart(animator, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, 0.265f, 0.25f, teal);
-            AddPart(animator, HumanBodyBones.LeftLowerLeg, HumanBodyBones.LeftFoot, 0.187f, 0.191f, teal);
-            AddPart(animator, HumanBodyBones.RightLowerLeg, HumanBodyBones.RightFoot, 0.187f, 0.191f, teal);
-            AddPart(animator, HumanBodyBones.LeftFoot, HumanBodyBones.LeftToes, 0.17f, 0.21f, orange);
-            AddPart(animator, HumanBodyBones.RightFoot, HumanBodyBones.RightToes, 0.17f, 0.21f, orange);
+
+            AddPart(animator, HumanBodyBones.Hips, HumanBodyBones.UpperChest, 0.44f, 0.255f);
+            AddPart(animator, HumanBodyBones.Hips, HumanBodyBones.LastBone, 0.37f, 0.285f);
+            AddPart(animator, HumanBodyBones.Neck, HumanBodyBones.Head, 0.145f, 0.145f);
+            AddPart(animator, HumanBodyBones.Head, HumanBodyBones.LastBone, 0.265f, 0.265f);
+            AddPart(animator, HumanBodyBones.LeftUpperArm, HumanBodyBones.LeftLowerArm, 0.215f, 0.208f);
+            AddPart(animator, HumanBodyBones.RightUpperArm, HumanBodyBones.RightLowerArm, 0.215f, 0.208f);
+            AddPart(animator, HumanBodyBones.LeftLowerArm, HumanBodyBones.LeftHand, 0.173f, 0.166f);
+            AddPart(animator, HumanBodyBones.RightLowerArm, HumanBodyBones.RightHand, 0.173f, 0.166f);
+            AddPart(animator, HumanBodyBones.LeftHand, HumanBodyBones.LastBone, 0.157f, 0.144f);
+            AddPart(animator, HumanBodyBones.RightHand, HumanBodyBones.LastBone, 0.157f, 0.144f);
+            AddPart(animator, HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, 0.265f, 0.25f);
+            AddPart(animator, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, 0.265f, 0.25f);
+            AddPart(animator, HumanBodyBones.LeftLowerLeg, HumanBodyBones.LeftFoot, 0.187f, 0.191f);
+            AddPart(animator, HumanBodyBones.RightLowerLeg, HumanBodyBones.RightFoot, 0.187f, 0.191f);
+            AddPart(animator, HumanBodyBones.LeftFoot, HumanBodyBones.LeftToes, 0.17f, 0.21f);
+            AddPart(animator, HumanBodyBones.RightFoot, HumanBodyBones.RightToes, 0.17f, 0.21f);
         }
 
         private void AddPart(Animator animator, HumanBodyBones start, HumanBodyBones end,
-            float width, float depth, Color color)
+            float width, float depth)
         {
             Transform first = animator.GetBoneTransform(start);
             Transform last = end == HumanBodyBones.LastBone ? null : animator.GetBoneTransform(end);
@@ -914,48 +1105,8 @@ namespace PersonalSpace
             if (first == null)
                 return;
 
-            FighterAnatomy.Shape? anatomy = GetAnatomyShape(start, last != null);
-            PrimitiveType shape = last != null ? PrimitiveType.Capsule : PrimitiveType.Sphere;
-            Transform visual = CreateShape(start.ToString(), shape, color);
-            if (anatomy.HasValue)
-                visual.GetComponent<MeshFilter>().sharedMesh = GetAnatomyMesh(anatomy.Value);
-
             parts.Add(new BodyPart { Bone = start, Start = first, End = last, Width = width * FighterScale,
-                Depth = depth * FighterScale, Visual = visual, Color = color, UsesAnatomyMesh = anatomy.HasValue });
-
-        }
-
-        private static FighterAnatomy.Shape? GetAnatomyShape(HumanBodyBones bone, bool hasEnd)
-        {
-            switch (bone)
-            {
-                case HumanBodyBones.Head: return null;
-                case HumanBodyBones.Neck: return FighterAnatomy.Shape.Neck;
-                case HumanBodyBones.Hips: return hasEnd ? FighterAnatomy.Shape.Chest : null;
-                case HumanBodyBones.LeftUpperArm:
-                case HumanBodyBones.RightUpperArm: return FighterAnatomy.Shape.UpperArm;
-                case HumanBodyBones.LeftLowerArm:
-                case HumanBodyBones.RightLowerArm: return FighterAnatomy.Shape.Forearm;
-                case HumanBodyBones.LeftHand:
-                case HumanBodyBones.RightHand: return FighterAnatomy.Shape.Hand;
-                case HumanBodyBones.LeftUpperLeg:
-                case HumanBodyBones.RightUpperLeg: return FighterAnatomy.Shape.Thigh;
-                case HumanBodyBones.LeftLowerLeg:
-                case HumanBodyBones.RightLowerLeg: return FighterAnatomy.Shape.Calf;
-                case HumanBodyBones.LeftFoot:
-                case HumanBodyBones.RightFoot: return FighterAnatomy.Shape.Foot;
-                default: return null;
-            }
-        }
-
-        private Mesh GetAnatomyMesh(FighterAnatomy.Shape shape)
-        {
-            if (!anatomyMeshes.TryGetValue(shape, out Mesh mesh))
-            {
-                mesh = FighterAnatomy.Create(shape);
-                anatomyMeshes.Add(shape, mesh);
-            }
-            return mesh;
+                Depth = depth * FighterScale });
         }
 
         private void BuildPhysicalBody()
@@ -987,24 +1138,24 @@ namespace PersonalSpace
                     part.Contact = rounded;
                 }
                 part.Body = root.AddComponent<Rigidbody>();
-                part.Body.mass = part.Bone == HumanBodyBones.Hips ? 8f :
-                    part.Bone == HumanBodyBones.Head ? 2.6f : 1.7f;
+                part.Body.mass = PartMass(part);
+                if (part.Bone == HumanBodyBones.LeftFoot || part.Bone == HumanBodyBones.RightFoot)
+                    SetUpFoot(part, root);
                 bodyMass += part.Body.mass;
                 part.Body.interpolation = RigidbodyInterpolation.Interpolate;
                 part.Body.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
-                part.Body.solverIterations = 12;
+                // Give the loaded arm chain more solver passes without changing its freedom to bend.
+                bool supportsGrip = part.Bone == HumanBodyBones.Hips || ArmFor(part.Bone) != null;
+                part.Body.solverIterations = supportsGrip ? 24 : 12;
+                if (supportsGrip)
+                    part.Body.solverVelocityIterations = 8;
                 part.Body.maxAngularVelocity = 15f;
                 part.NormalDepenetrationSpeed = part.Body.maxDepenetrationVelocity;
                 PillArmMotion fist = part.Bone == HumanBodyBones.LeftHand || part.Bone == HumanBodyBones.RightHand
                     ? ArmFor(part.Bone) : null;
                 root.AddComponent<PillBodyContact>().Initialize(this, part, fist);
 
-                part.Visual.SetParent(root.transform, false);
-                part.Visual.localPosition = Vector3.zero;
-                part.Visual.localRotation = Quaternion.identity;
-                part.Visual.localScale = part.End != null && !part.UsesAnatomyMesh
-                    ? new Vector3(size.x, size.y * 0.5f, size.z)
-                    : size;
+
                 Physics.IgnoreCollision(capsule, part.Contact);
             }
 
@@ -1015,6 +1166,48 @@ namespace PersonalSpace
                     JoinParts(part, part.Parent);
             }
             ApplySelfCollisionRules();
+        }
+
+        private static float PartMass(BodyPart part)
+        {
+            switch (part.Bone)
+            {
+                case HumanBodyBones.Hips: return part.End != null ? 8.5f : 5f;
+                case HumanBodyBones.Head: return 3.3f;
+                case HumanBodyBones.Neck: return 0.8f;
+                case HumanBodyBones.LeftUpperArm:
+                case HumanBodyBones.RightUpperArm: return 1.6f;
+                case HumanBodyBones.LeftLowerArm:
+                case HumanBodyBones.RightLowerArm: return 1.1f;
+                case HumanBodyBones.LeftHand:
+                case HumanBodyBones.RightHand: return 0.65f;
+                case HumanBodyBones.LeftUpperLeg:
+                case HumanBodyBones.RightUpperLeg: return 4.4f;
+                case HumanBodyBones.LeftLowerLeg:
+                case HumanBodyBones.RightLowerLeg: return 2.6f;
+                case HumanBodyBones.LeftFoot:
+                case HumanBodyBones.RightFoot: return 1.1f;
+                default: return 1.7f;
+            }
+        }
+
+        private static bool IsLowerBody(HumanBodyBones bone) => HipDropWeight(bone) < 1f;
+
+        private void SetUpFoot(BodyPart part, GameObject root)
+        {
+            if (footGrip == null)
+                footGrip = new PhysicsMaterial("Fighter Foot Grip")
+                {
+                    staticFriction = 0.85f,
+                    dynamicFriction = 0.60f,
+                    frictionCombine = PhysicsMaterialCombine.Maximum
+                };
+            part.Contact.sharedMaterial = footGrip;
+            var sensor = root.AddComponent<RagdollFootContact>();
+            if (part.Bone == HumanBodyBones.LeftFoot)
+                leftFootContact = sensor;
+            else
+                rightFootContact = sensor;
         }
 
         private BodyPart FindPhysicalParent(BodyPart part)
@@ -1078,45 +1271,15 @@ namespace PersonalSpace
             joint.xMotion = ConfigurableJointMotion.Locked;
             joint.yMotion = ConfigurableJointMotion.Locked;
             joint.zMotion = ConfigurableJointMotion.Locked;
+            joint.enablePreprocessing = false;
+            joint.projectionMode = JointProjectionMode.PositionAndRotation;
+            joint.projectionDistance = 0.025f;
+            joint.projectionAngle = 12f;
             // The compound parts stay joined at the bone while retaining rotation.
             joint.angularXMotion = ConfigurableJointMotion.Free;
             joint.angularYMotion = ConfigurableJointMotion.Free;
             joint.angularZMotion = ConfigurableJointMotion.Free;
-            CreateVisualJoin(joint, part, parent);
-        }
 
-        private void CreateVisualJoin(ConfigurableJoint joint, BodyPart child, BodyPart parent)
-        {
-            float width = Mathf.Min(Mathf.Min(child.Width, child.Depth), Mathf.Min(parent.Width, parent.Depth));
-            var join = new VisualJoin
-            {
-                Joint = joint,
-                Child = child,
-                Parent = parent,
-                Shape = CreateShape(child.Bone + " Skin Join", PrimitiveType.Capsule, child.Color),
-                Width = width * 0.98f
-            };
-            visualJoins.Add(join);
-            PlaceVisualJoin(join);
-        }
-
-        private static void PlaceVisualJoin(VisualJoin join)
-        {
-            Transform child = join.Child.Body.transform;
-            Transform parent = join.Parent.Body.transform;
-            Vector3 childPivot = child.TransformPoint(join.Joint.anchor);
-            Vector3 parentPivot = parent.TransformPoint(join.Joint.connectedAnchor);
-            // Start the sleeve inside both visible pieces so it stays connected as
-            // those pieces rotate and the rounded ends move away from the joint.
-            Vector3 start = Vector3.Lerp(parent.position, parentPivot, 0.52f);
-            Vector3 end = Vector3.Lerp(child.position, childPivot, 0.52f);
-            Vector3 axis = end - start;
-            Quaternion rotation = axis.sqrMagnitude > 0.00001f
-                ? Quaternion.FromToRotation(Vector3.up, axis)
-                : child.rotation;
-            join.Shape.SetPositionAndRotation((start + end) * 0.5f, rotation);
-            float length = axis.magnitude + join.Width * 0.82f;
-            join.Shape.localScale = new Vector3(join.Width, length * 0.5f, join.Width * 0.94f);
         }
 
         private void GetPose(BodyPart part, out Vector3 position, out Quaternion rotation, out Vector3 size)
@@ -1181,20 +1344,24 @@ namespace PersonalSpace
                 return;
 
             bool recovering = IsRecovering;
-            Vector3 center = recovering ? torso.Body.position : (torso.Start.position + torso.End.position) * 0.5f;
-            var mouse = isPracticeDummy ? null : Mouse.current;
+            Vector3 center = recovering || hanging ? torso.Body.position : (torso.Start.position + torso.End.position) * 0.5f;
             bool blockJabs = Status == FighterStatus.KnockedOut || (duckingUnderPress && !recovering) || flyingKick?.IsActive == true;
-            leftArm?.Update(step, center, blockJabs, mouse != null && mouse.leftButton.isPressed,
-                recovering ? PhysicalShoulder(leftShoulder) : null);
-            rightArm?.Update(step, center, blockJabs, mouse != null && mouse.rightButton.isPressed,
-                recovering ? PhysicalShoulder(rightShoulder) : null);
+            bool leftBraced = hanging && IsClimbingGrip(leftArm);
+            bool rightBraced = hanging && IsClimbingGrip(rightArm);
+            leftArm?.Update(step, center, blockJabs,
+                recovering || hanging ? PhysicalShoulder(leftShoulder) : null, gripTargeting,
+                rightBraced && !leftBraced ? rightArm.GripPoint : (Vector3?)null, climbing.IntoLedge);
+            rightArm?.Update(step, center, blockJabs,
+                recovering || hanging ? PhysicalShoulder(rightShoulder) : null, gripTargeting,
+                leftBraced && !rightBraced ? leftArm.GripPoint : (Vector3?)null, climbing.IntoLedge);
         }
 
         private static Vector3? PhysicalShoulder(BodyPart part)
         {
             if (part?.Joint == null)
                 return null;
-            return part.Joint.connectedBody.transform.TransformPoint(part.Joint.connectedAnchor);
+            Rigidbody parent = part.Joint.connectedBody;
+            return parent.position + parent.rotation * part.Joint.connectedAnchor;
         }
 
         private PillArmMotion ArmFor(HumanBodyBones bone)
@@ -1255,12 +1422,25 @@ namespace PersonalSpace
             clips[2].SetSpeed(Mathf.Clamp(speed / (4f * FighterScale), 0.4f, 1.45f));
         }
 
+        private void OnDisable()
+        {
+            leftArm?.ResetInput();
+            rightArm?.ResetInput();
+            climbing.Cancel();
+        }
+
         private void OnDestroy()
         {
             if (graph.IsValid())
                 graph.Destroy();
-            foreach (Mesh mesh in anatomyMeshes.Values)
-                Destroy(mesh);
+            if (footGrip != null)
+                Destroy(footGrip);
+            if (fighterModel != null)
+            {
+                foreach (Material material in fighterModel.sharedMaterials)
+                    Destroy(material);
+                Destroy(fighterModel.sharedMesh);
+            }
         }
 
         private static float Axis(UnityEngine.InputSystem.Controls.KeyControl positive,

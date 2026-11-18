@@ -9,6 +9,7 @@ namespace PersonalSpace
         private const float ExtensionEnd = 0.12f;
         private const float HoldTime = 0.15f;
         private const float ReachScale = 1.16f;
+        private const float TapTime = 0.16f;
         private readonly Transform shoulderBone;
         private readonly Transform elbowBone;
         private readonly Transform handBone;
@@ -20,12 +21,30 @@ namespace PersonalSpace
         private float jabTime = JabDuration;
         private Vector3 localJabDirection;
         private bool hitConsumed;
+        private float heldTime = -1f;
+        private bool grabInput;
+        private bool waitForRelease;
+        private bool latchedThisPress;
+        private ConfigurableJoint grip;
+        private Collider gripSurface;
+        private Vector3 surfacePoint;
+        private Vector3 surfaceNormal;
+        private float minimumClimbGripHeight;
 
         internal Vector3 Shoulder { get; private set; }
         internal Vector3 Elbow { get; private set; }
         internal Vector3 Hand { get; private set; }
         internal Vector3 StrikeDirection { get; private set; }
         internal bool IsRetracting { get; private set; }
+        internal bool IsReachingUp { get; private set; }
+        internal bool GrabHeld => grabInput;
+        internal bool WantsGrip => grabInput && !waitForRelease;
+        internal float Reach => (upperLength + lowerLength) * 0.99f;
+        internal PillBodyContact HeldFighterPart { get; private set; }
+        internal bool HasGrip => grip != null && gripSurface != null;
+        internal Collider GripSurface => gripSurface;
+        internal Vector3 GripPoint => gripSurface.transform.TransformPoint(surfacePoint);
+        internal Vector3 GripNormal => gripSurface.transform.TransformDirection(surfaceNormal);
 
         internal PillArmMotion(Transform player, Transform shoulder, Transform elbow, Transform hand, float side, float sizeScale)
         {
@@ -38,6 +57,118 @@ namespace PersonalSpace
             upperLength = ReachScale * Vector3.Distance(shoulder.position, elbow.position);
             lowerLength = ReachScale * Vector3.Distance(elbow.position, hand.position);
         }
+
+        internal bool UpdateButton(bool pressed, bool released, bool held, float step)
+        {
+            if (pressed)
+                heldTime = 0f;
+            if (heldTime < 0f)
+                return false;
+
+            if (!held)
+            {
+                bool tapped = released && heldTime < TapTime && !latchedThisPress;
+                ResetInput();
+                return tapped;
+            }
+
+            grabInput = true;
+            heldTime += step;
+            if (grip != null && (gripSurface == null || !gripSurface.enabled || !gripSurface.gameObject.activeInHierarchy))
+                ReleaseGrip(true);
+            return false;
+        }
+
+        internal void ResetInput()
+        {
+            heldTime = -1f;
+            grabInput = false;
+            latchedThisPress = false;
+            IsReachingUp = false;
+            ReleaseGrip(false);
+        }
+
+        internal void ReleaseGrip(bool wait)
+        {
+            if (grip != null)
+                Object.Destroy(grip);
+            grip = null;
+            gripSurface = null;
+            HeldFighterPart = null;
+            waitForRelease = wait;
+        }
+
+        internal void TryGrip(Rigidbody hand, Collider surface, Rigidbody other, Vector3 point, Vector3 normal)
+        {
+            if (!WantsGrip || HasGrip || surface == null || surface is CharacterController)
+                return;
+            if (other == null && normal.y > 0.65f && point.y < player.position.y + 0.25f)
+                return;
+            if (IsReachingUp && point.y < minimumClimbGripHeight)
+                return;
+
+            latchedThisPress = true;
+            jabTime = JabDuration;
+            StrikeDirection = Vector3.zero;
+            HeldFighterPart = other != null ? other.GetComponent<PillBodyContact>() : null;
+            var joint = hand.gameObject.AddComponent<ConfigurableJoint>();
+            joint.autoConfigureConnectedAnchor = false;
+            joint.connectedBody = other;
+            joint.anchor = PhysicsTransform(hand).inverse.MultiplyPoint3x4(point);
+            joint.connectedAnchor = other != null ? PhysicsTransform(other).inverse.MultiplyPoint3x4(point) : point;
+            joint.xMotion = joint.yMotion = joint.zMotion = ConfigurableJointMotion.Locked;
+            joint.enablePreprocessing = false;
+            joint.projectionMode = JointProjectionMode.PositionAndRotation;
+            joint.projectionDistance = 0.025f;
+            joint.projectionAngle = 12f;
+            joint.angularXMotion = joint.angularYMotion = joint.angularZMotion = ConfigurableJointMotion.Free;
+            joint.enableCollision = true;
+            joint.breakForce = 2200f;
+            grip = joint;
+            gripSurface = surface;
+            surfacePoint = surface.transform.InverseTransformPoint(point);
+            surfaceNormal = surface.transform.InverseTransformDirection(normal);
+        }
+
+        internal void PullFromGrip(ConfigurableJoint shoulder, Vector3 intoLedge, bool hoisting, bool pressing,
+            float forceLimit)
+        {
+            if (!HasGrip || shoulder?.connectedBody == null)
+                return;
+
+            Rigidbody hand = grip.GetComponent<Rigidbody>();
+            Rigidbody chest = shoulder.connectedBody;
+            Vector3 palm = PhysicsTransform(hand).MultiplyPoint3x4(grip.anchor);
+            Vector3 socket = PhysicsTransform(chest).MultiplyPoint3x4(shoulder.connectedAnchor);
+            Vector3 toPalm = palm - socket;
+            float distance = toPalm.magnitude;
+            if (distance < 0.001f)
+                return;
+
+            Vector3 relativeVelocity = hand.GetPointVelocity(palm) - chest.GetPointVelocity(socket);
+            Vector3 axis = toPalm / distance;
+            Vector3 effort;
+            if (pressing)
+            {
+                // With the palm over the lip, extend the arm and press the chest onto the ledge.
+                Vector3 raisedSocket = palm + (Vector3.up * 0.76f + intoLedge * 0.52f) * Reach;
+                effort = (raisedSocket - socket) * 1250f + relativeVelocity * 135f;
+            }
+            else
+            {
+                float length = Reach * (hoisting ? 0.31f : 0.94f);
+                float closingForce = (distance - length) * 1700f + Vector3.Dot(relativeVelocity, axis) * 125f;
+                effort = axis * Mathf.Max(0f, closingForce);
+            }
+
+            // Both ends of the muscle receive opposite forces. The ledge supplies the reaction.
+            effort = Vector3.ClampMagnitude(effort, forceLimit);
+            chest.AddForceAtPosition(effort, socket);
+            hand.AddForceAtPosition(-effort, palm);
+        }
+
+        private static Matrix4x4 PhysicsTransform(Rigidbody body)
+            => Matrix4x4.TRS(body.position, body.rotation, body.transform.lossyScale);
 
         internal void Jab(Vector3? target)
         {
@@ -63,7 +194,8 @@ namespace PersonalSpace
             return true;
         }
 
-        internal void Update(float step, Vector3 torso, bool duckingUnderPress, bool held, Vector3? physicalShoulder = null)
+        internal void Update(float step, Vector3 torso, bool blockJabs, Vector3? physicalShoulder = null,
+            PillGripTargeting targeting = null, Vector3? otherGrip = null, Vector3 intoLedge = default)
         {
             Vector3 outward = player.right * side;
             Shoulder = physicalShoulder ?? (shoulderBone.position + outward * (0.055f * sizeScale));
@@ -73,9 +205,33 @@ namespace PersonalSpace
             Vector3 targetHand = KeepArmClear(extendedHand, torso, 0.315f);
             float armLength = upperLength + lowerLength;
             StrikeDirection = Vector3.zero;
-            if (duckingUnderPress)
+            if (blockJabs || HasGrip || (WantsGrip && heldTime >= TapTime))
                 jabTime = JabDuration;
             IsRetracting = jabTime > HoldTime && jabTime < JabDuration;
+            IsReachingUp = otherGrip.HasValue && !HasGrip && !blockJabs && jabTime >= JabDuration;
+            if (IsReachingUp)
+            {
+                minimumClimbGripHeight = otherGrip.Value.y - 0.06f;
+                Vector3 reachDirection = (Vector3.up + intoLedge * 0.50f + outward * 0.11f).normalized;
+                targetHand = Shoulder + reachDirection * Reach;
+                animatedElbow = Shoulder + outward * (0.23f * sizeScale) + Vector3.up * (0.26f * sizeScale);
+                if (WantsGrip && targeting != null &&
+                    (targeting.TryFind(Shoulder, player.position.y, intoLedge, Reach, out Vector3 higher, otherGrip.Value.y + 0.10f) ||
+                     targeting.TryFind(Shoulder, player.position.y, intoLedge, Reach, out higher, minimumClimbGripHeight)))
+                    targetHand = higher;
+            }
+            else if (WantsGrip && jabTime >= JabDuration)
+            {
+                float pitch = (HasGrip ? 25f : 42f) * Mathf.Deg2Rad;
+                Vector3 reach = player.forward * Mathf.Cos(pitch) + Vector3.up * Mathf.Sin(pitch);
+                targetHand = Shoulder + (reach * 0.94f + outward * 0.10f) * armLength;
+                animatedElbow = Shoulder + outward * (0.25f * sizeScale) - Vector3.up * (0.22f * sizeScale);
+                if (HasGrip && gripSurface.attachedRigidbody == null)
+                    targetHand = GripPoint;
+                else if (!HasGrip && targeting != null &&
+                    targeting.TryFind(Shoulder, player.position.y, player.forward, Reach, out Vector3 nearby))
+                    targetHand = nearby;
+            }
             if (jabTime < JabDuration)
             {
                 Vector3 aim = player.TransformDirection(localJabDirection);
@@ -93,7 +249,7 @@ namespace PersonalSpace
             }
 
             if (jabTime < JabDuration)
-                jabTime = held && jabTime <= HoldTime ? Mathf.Min(jabTime + step, HoldTime) : jabTime + step;
+                jabTime += step;
             // Solve for the elbow while keeping the reach inside the two bone lengths.
             Vector3 offset = targetHand - Shoulder;
             float length = Mathf.Clamp(offset.magnitude, Mathf.Abs(upperLength - lowerLength) + 0.01f * sizeScale,

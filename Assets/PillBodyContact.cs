@@ -23,7 +23,7 @@ namespace PersonalSpace
 
         private void OnCollisionStay(Collision collision)
         {
-            if (Fighter != null && Part != null && collision.rigidbody != null)
+            if (Fighter != null && Part != null && (collision.rigidbody != null || fist?.WantsGrip == true))
                 Fighter.HandleBodyContact(Part, fist, collision, false);
         }
     }

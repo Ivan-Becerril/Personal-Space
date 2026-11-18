@@ -14,8 +14,10 @@ Animation source files are downloaded separately under the [publisher's license]
 ## Controls
 
 - **WASD** to walk, **Shift** to run, and **Space** to jump.
-- **Left click** and **right click** jab with the corresponding hand.
-- **Middle mouse drag** or **Q/E** to orbit, **scroll** to zoom, and **R** to recenter.
+- Hold a **mouse button** to reach toward a nearby object with that hand and grab on contact. Release to let go. Tap with no contact to jab.
+- Grab a fighter and move away to drag them. Two hands give you a stronger pull.
+- Grab near a ledge, then hold **Space** to pull up through the planted arm. Move toward the ledge to press over it. The free hand reaches above the planted hand so you can grab higher. Steer sideways to twist while hanging.
+- The camera automatically follows the action and frames nearby fighters together.
 - **P** raises or lowers the hydraulic press.
 
 City Stage is the default test map. It contains the furnished apartment, hydraulic press bay, and a playable street outside the north doorway. The standalone ApartmentTest scene is available in Assets/Scenes.
